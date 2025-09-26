@@ -9,6 +9,9 @@ const BAD_WORDS = [
   "cover","karaoke","tribute","sped up","speed up","slowed","nightcore"
 ]
 
+// Romanized/翻訳ページ優先度制御用マーカー（BAD_WORDS には入れず保留評価）
+const ROMANIZED_MARKERS = ["romanized","translation","translated"]
+
 const NOISE_WORDS = new Set([
   "official","music","video","musicvideo","mv","pv","lyric","lyrics","ver","version",
   "visualizer","teaser","trailer","short","shorts","full","performance","live",
@@ -30,19 +33,17 @@ const COVER_REMOVE_PATTERNS: RegExp[] = [
 ]
 
 /* feat / descriptor */
-/* CHANGED: add "original" so (Original Instrumental) 全体を descriptor 括弧として扱える */
 const FEAT_WORDS = new Set(["feat","ft","featuring","with"])
 const DESCRIPTOR_KEYWORDS = new Set([
   "instrumental","inst","offvocal","off-vocal","acoustic","acapella","a","cappella",
   "karaoke","カラオケ","カラオケver","カラオケversion","カラオケ音源",
-  "original" // added
+  "original"
 ])
 
 /* ================ Utility ================ */
 function normalizeSpaces(s: string) {
   return s.replace(/\s+/g," ").trim()
 }
-
 function tokenizeRaw(s: string) {
   return s
     .toLowerCase()
@@ -53,15 +54,12 @@ function tokenizeRaw(s: string) {
     .map(t=>t.trim())
     .filter(Boolean)
 }
-
 function tokenizeForMatch(s: string) {
   return tokenizeRaw(s).filter(t => !STOPWORDS.has(t) && !/^\d+$/.test(t))
 }
-
 function stripPunctLower(s: string) {
   return s.toLowerCase().replace(/[\s'"!?:.,\-–—_]/g,"")
 }
-
 function stripBracketedNoise(title: string): string {
   return title
     .replace(/(\[[^\]]*])/g, (m) => {
@@ -78,11 +76,9 @@ function stripBracketedNoise(title: string): string {
       return m
     })
 }
-
 function removeMatchedParens(title: string): string {
   return title.replace(/\(\s*\)/g," ").replace(/\s+/g," ").trim()
 }
-
 function dashTruncateIfNoise(title: string): string {
   let best = title
   for (const sep of DASH_SPLIT_SEPARATORS) {
@@ -100,7 +96,6 @@ function dashTruncateIfNoise(title: string): string {
   }
   return best
 }
-
 function basicCleanTitle(raw: string): string {
   let t = raw
   t = stripBracketedNoise(t)
@@ -122,22 +117,18 @@ interface CoverExtraction { coverDetected: boolean; coreTitle: string; originalR
 function extractCoreTitle(raw: string): CoverExtraction {
   let work = raw
   let coverDetected = false
-
   work = work.replace(/^[【\[]([^】\]]+)[】\]]\s*/g, (_m, inner) => {
     if (COVER_MARKERS.test(inner)) { coverDetected = true; return "" }
     return _m
   })
-
   for (const re of COVER_REMOVE_PATTERNS) {
     if (re.test(work)) {
       coverDetected = true
       work = work.replace(re, "").trim()
     }
   }
-
   work = work.replace(/\bcover\s*$/i, () => { coverDetected = true; return "" }).trim()
   work = normalizeSpaces(work)
-
   return { coverDetected, coreTitle: work, originalRaw: raw }
 }
 
@@ -159,30 +150,22 @@ function extractDescriptorBase(text: string): string {
   out = toks.join(" ")
   return normalizeSpaces(out)
 }
-
 function generateTitleVariants(raw: string): string[] {
   const set = new Set<string>()
   const cleaned = basicCleanTitle(raw)
   set.add(cleaned)
-
   const noFeat = cleaned.replace(/\b(feat|ft|featuring|with)\b.*$/i, "").trim()
   if (noFeat && noFeat !== cleaned) set.add(noFeat)
-
   const noEngParen = cleaned.replace(/\([A-Za-z0-9 ,.'&\-]+\)/g, " ").replace(/\s+/g," ").trim()
   if (noEngParen && !set.has(noEngParen)) set.add(noEngParen)
-
   const descBase = extractDescriptorBase(cleaned)
   if (descBase && !set.has(descBase)) set.add(descBase)
-
   const noFeatDesc = extractDescriptorBase(noFeat)
   if (noFeatDesc && !set.has(noFeatDesc)) set.add(noFeatDesc)
-
   const noEngDesc = extractDescriptorBase(noEngParen)
   if (noEngDesc && !set.has(noEngDesc)) set.add(noEngDesc)
-
   return [...set].filter(v => v.length > 0)
 }
-
 function removeDescriptorsTokens(tokens: string[]) {
   return tokens.filter(t => !DESCRIPTOR_KEYWORDS.has(t))
 }
@@ -282,7 +265,6 @@ async function findGeniusUrl(title: string, artist: string, debug: boolean): Pro
   const dashReduced = dashTruncateIfNoise(cleaned)
   const { coverDetected, coreTitle } = extractCoreTitle(cleaned)
   const descriptorBase = extractDescriptorBase(cleaned)
-
   const baseTitle = extractDescriptorBase(
     cleaned.replace(/\b(feat|ft|featuring|with)\b.*$/i,"").trim()
   ) || cleaned
@@ -317,17 +299,22 @@ async function findGeniusUrl(title: string, artist: string, debug: boolean): Pro
 
   const debugLogs: any[] = []
   let acceptedGlobal: any = null
+  let penalizedFallback: any = null
+
+  const origLower = title.toLowerCase()
 
   for (const q of finalQueries) {
     let hits: any[] = []
     try { hits = await geniusSearch(q.q) } catch { /* ignore */ }
 
-    let accepted: any = null
     const examined: any[] = []
+    let acceptedInQuery: any = null
+    penalizedFallback = penalizedFallback // keep previous if set
+
     for (const h of hits) {
       const r = h.result
-      const cTitle = r.title || r.full_title || ""
-      const cArtist = r.primary_artist?.name || ""
+      const cTitle: string = r.title || r.full_title || ""
+      const cArtist: string = r.primary_artist?.name || ""
       const reasons: string[] = []
 
       if (hasBadWord(cTitle, title)) {
@@ -343,38 +330,81 @@ async function findGeniusUrl(title: string, artist: string, debug: boolean): Pro
         continue
       }
 
-      if (
-        !titleLikelySame(title, cTitle) &&
-        !(coreTitle && titleLikelySame(coreTitle, cTitle)) &&
-        !(descriptorBase && titleLikelySame(descriptorBase, cTitle)) &&
-        !(baseTitle && titleLikelySame(baseTitle, cTitle))
-      ) {
+      // Romanized / Translation ページ判定（元タイトルに無い場合のみ penalize）
+      const cLower = cTitle.toLowerCase()
+      let isPenalized = false
+      if (!ROMANIZED_MARKERS.some(m => origLower.includes(m))) {
+        if (ROMANIZED_MARKERS.some(m => cLower.includes(m))) {
+          isPenalized = true
+        }
+      }
+
+      // タイトル一致判定
+      const same =
+        titleLikelySame(title, cTitle) ||
+        (coreTitle && titleLikelySame(coreTitle, cTitle)) ||
+        (descriptorBase && titleLikelySame(descriptorBase, cTitle)) ||
+        (baseTitle && titleLikelySame(baseTitle, cTitle))
+
+      if (!same) {
         reasons.push("reject:title_mismatch")
-        examined.push({ id: r.id, title: cTitle, artist: cArtist, decision: reasons.join("|") })
+        examined.push({ id: r.id, title: cTitle, artist: cArtist, decision: reasons.join("|"), penalized: isPenalized })
         continue
       }
 
+      if (isPenalized) {
+        // まだ非 penalized を確定していなければ保留
+        reasons.push("penalized_candidate")
+        const penal = {
+          id: r.id,
+            title: cTitle,
+            artist: cArtist,
+            url: r.url,
+            decision: reasons.join("|"),
+            usedQuery: q.label,
+            penalized: true
+        }
+        examined.push(penal)
+        // 最初の penalized 保留だけ保持（より後ろの penalized は無視）
+        if (!penalizedFallback) penalizedFallback = penal
+        continue
+      }
+
+      // 非 penalized accept
       reasons.push("accept")
-      accepted = {
+      acceptedInQuery = {
         id: r.id,
         title: cTitle,
         artist: cArtist,
         url: r.url,
         decision: reasons.join("|"),
-        usedQuery: q.label
+        usedQuery: q.label,
+        penalized: false
       }
-      examined.push(accepted)
+      examined.push(acceptedInQuery)
       break
     }
 
     debugLogs.push({ query: q, examined })
-    if (accepted) { acceptedGlobal = accepted; break }
+
+    if (acceptedInQuery) {
+      acceptedGlobal = acceptedInQuery
+      break
+    }
+    // 非 penalized が取れず、他クエリをまだ試す。最後まで無ければ penalizedFallback を使う
+  }
+
+  if (!acceptedGlobal && penalizedFallback) {
+    // 最終的に非 penalized なし → penalizedFallback 採用
+    penalizedFallback.decision += "|accept:penalized_fallback"
+    acceptedGlobal = penalizedFallback
   }
 
   return {
     url: acceptedGlobal ? acceptedGlobal.url : null,
     debug: debug ? {
       accepted: acceptedGlobal,
+      penalizedUsed: !!(acceptedGlobal && acceptedGlobal.penalized),
       coverDetected,
       coreTitle,
       descriptorBase,
