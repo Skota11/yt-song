@@ -2,16 +2,13 @@ import { Hono } from 'https://deno.land/x/hono/mod.ts'
 import { cors } from 'https://deno.land/x/hono/middleware.ts'
 import ytdl from "npm:@distube/ytdl-core"
 
-/* ================= Config (minimal + descriptor & cover) ================= */
+/* ================= Config ================= */
 const geniusToken = Deno.env.get("GENIUS_ACCESS_TOKEN")
 
-/* ========= BAD / NOISE / DESCRIPTOR (拡張保持) ========= */
-const BASE_BAD_WORDS = [
-  "cover","karaoke","tribute","sped up","speed up","slowed","nightcore"
-]
+/* ========= BAD / NOISE / DESCRIPTOR ========= */
+const BASE_BAD_WORDS = ["cover","karaoke","tribute","sped up","speed up","slowed","nightcore"]
 const BAD_WORDS = [...BASE_BAD_WORDS]
 
-/* ノイズ語 (既存+拡張) */
 const EXTRA_NOISE = [
   "the","first","take","thefirsttake","youtube","yt","official","offical",
   "mv","musicvideo","live","tour","livetour","session","lounge",
@@ -23,7 +20,6 @@ const EXTRA_NOISE = [
   "lyric","lyrics"
 ]
 
-/* Romanized/翻訳ページマーカー (reject ではなく penalize) */
 const ROMANIZED_MARKERS = ["romanized","translation","translated","english"]
 
 const NOISE_WORDS = new Set([
@@ -34,7 +30,6 @@ const NOISE_WORDS = new Set([
 ])
 const STOPWORDS = new Set([...NOISE_WORDS])
 
-const MIN_TOKEN_OVERLAP = 0.6
 const DASH_SPLIT_SEPARATORS = [" - ", " | "]
 
 /* Cover detection */
@@ -57,96 +52,99 @@ const DESCRIPTOR_KEYWORDS = new Set([
   "tv","tvsize","demo","edit","short","piano","acoustic","live","version","ver"
 ])
 
-/* ========= Aggressive 括弧内削除トリガ (要望により随時追加) =========
-   ここに含まれる語を ( ) / [ ] 内に一つでも含めば丸ごと除去
-   （大文字小文字無視・部分一致）
-*/
+/* Aggressive 括弧内削除トリガ */
 const BRACKET_INNER_REMOVE_TRIGGERS = [
-  // 一般 MV / ライブ
   "music","video","mv","pv","official","live","live ver","live version","performance",
   "session","lounge","tour","stage","studio",
-  // メイキング / 舞台裏
   "behind","behind the scenes","bts","making","making of","making-of",
-  // 配信/企画
   "the first take","first take","youtube ver","youtube version","yt ver",
-  // 表記/歌詞
   "lyric","lyrics","english translation","translation","translated","romanized","romaji",
-  // バージョン区分
   "ver","version","alt ver","alternate","alternate ver","alternate version",
   "remix","mix","edit","demo","short ver","short version","short",
   "tv","tv size","tv-size","tvsize",
-  // 音源種別
   "acoustic","piano","inst","instrumental","off vocal","off-vocal","offvocal",
-  // その他よくある
   "visualizer","teaser","trailer","clip","full ver","full version",
-  // 言語タグ
   "english ver","english version","japanese ver","japanese version"
 ]
 
-function bracketInnerShouldRemove(inner: string): boolean {
-  const low = inner.toLowerCase()
-  return BRACKET_INNER_REMOVE_TRIGGERS.some(w => low.includes(w))
-}
-
 /* ================ Utility ================ */
-function normalizeSpaces(s: string) {
-  return s.replace(/\s+/g," ").trim()
-}
+const TOKEN_SPLIT_REGEX = /[\s\-_:/|.,!?]+/
+const EMPTY_PARENS_REGEX = /\(\s*\)/g
+const MULTI_SPACES_REGEX = /\s+/g
+const ENGLISH_PARENS_STRIP = /\([A-Za-z0-9 ,.'&\-]+\)/g
+const BRACKETS_SQ = /(\[[^\]]*])/g
+const BRACKETS_ROUND = /(\([^)]*\))/g
+const ARTIST_PREFIX_REGEX_PARTS_CACHE = new Map<string, RegExp>()
 
-/* 日本語括弧を [] に正規化 */
 function normalizeJapaneseBrackets(s: string): string {
-  return s
-    .replace(/[「『【〈《]/g,"[")
-    .replace(/[」』】〉》]/g,"]")
+  return s.replace(/[「『【〈《]/g,"[").replace(/[」』】〉》]/g,"]")
 }
-
 function normalizeQuotes(s: string): string {
   return s.replace(/[“”]/g,'"').replace(/[’‘]/g,"'")
 }
-
+function normalizeSpaces(s: string) {
+  return s.replace(MULTI_SPACES_REGEX," ").trim()
+}
 function tokenizeRaw(s: string) {
   return s
     .toLowerCase()
     .normalize("NFKC")
     .replace(/[“”"’']/g," ")
     .replace(/[#(){}]/g," ")
-    .split(/[\s\-_:/|.,!?]+/)
-    .map(t=>t.trim())
+    .split(TOKEN_SPLIT_REGEX)
     .filter(Boolean)
 }
-
 function tokenizeForMatch(s: string) {
-  return tokenizeRaw(s).filter(t => !STOPWORDS.has(t) && !/^\d+$/.test(t))
+  const raw = tokenizeRaw(s)
+  const out: string[] = []
+  for (const t of raw) {
+    if (STOPWORDS.has(t)) continue
+    if (/^\d+$/.test(t)) continue
+    out.push(t)
+  }
+  return out
 }
 
+/* 文字列 → 小文字＆記号除去（和文含む） */
 function stripPunctLower(s: string) {
-  return s.toLowerCase().replace(/[\s'"!?:.,\-–—_]/g,"")
+  return s.toLowerCase()
+    .replace(/[\s'"!?:.,\-–—_]/g,"")
+    .replace(/[！？。、（）（)【】「」『』·・…‥～]/g,"")
 }
 
-/* 括弧ノイズ除去 (要望に基づきトリガベースで積極削除) */
+/* 括弧内削除条件 */
+function bracketInnerShouldRemove(inner: string): boolean {
+  const low = inner.toLowerCase()
+  for (const w of BRACKET_INNER_REMOVE_TRIGGERS) {
+    if (low.includes(w)) return true
+  }
+  return false
+}
+
+/* 括弧ノイズ除去 */
 function stripBracketedNoise(title: string): string {
   // [ ... ]
-  title = title.replace(/(\[[^\]]*])/g, (m) => {
+  title = title.replace(BRACKETS_SQ, (m) => {
     const inner = m.slice(1,-1).trim()
     if (!inner) return " "
     if (bracketInnerShouldRemove(inner)) return " "
     const toks = inner.toLowerCase().split(/\s+/)
-    if (toks.length && toks.every(w => NOISE_WORDS.has(w) || /^(official|mv|pv)$/.test(w))) {
+    if (toks.length && toks.every(w => NOISE_WORDS.has(w) || w === "official" || w === "mv" || w === "pv")) {
       return " "
     }
     return m
   })
   // ( ... )
-  title = title.replace(/(\([^)]*\))/g, (m) => {
+  title = title.replace(BRACKETS_ROUND, (m) => {
     const inner = m.slice(1,-1).trim()
     if (!inner) return " "
     if (bracketInnerShouldRemove(inner)) return " "
     const lower = inner.toLowerCase()
     if (
-      /(official|music|video|lyrics?|romanized|translation|ver|version|live|remix|mix|alternate|remastered|tv\s*size)/.test(lower) &&
-      lower.split(/\s+/).every(w => NOISE_WORDS.has(w) || DESCRIPTOR_KEYWORDS.has(w))
+      /(official|music|video|lyrics?|romanized|translation|ver|version|live|remix|mix|alternate|remastered|tv\s*size)/.test(lower)
     ) {
-      return " "
+      const allNoise = lower.split(/\s+/).every(w => NOISE_WORDS.has(w) || DESCRIPTOR_KEYWORDS.has(w))
+      if (allNoise) return " "
     }
     return m
   })
@@ -154,57 +152,57 @@ function stripBracketedNoise(title: string): string {
 }
 
 function removeMatchedParens(title: string): string {
-  return title.replace(/\(\s*\)/g," ").replace(/\s+/g," ").trim()
+  return title.replace(EMPTY_PARENS_REGEX," ").replace(MULTI_SPACES_REGEX," ").trim()
 }
 
 function dashTruncateIfNoise(title: string): string {
-  let best = title
   for (const sep of DASH_SPLIT_SEPARATORS) {
-    if (title.toLowerCase().includes(sep.trim())) {
+    const idx = title.toLowerCase().indexOf(sep.trim())
+    if (idx !== -1) {
       const parts = title.split(sep)
       if (parts.length > 1) {
         const first = parts[0].trim()
-        const rest = parts.slice(1).join(" ").toLowerCase()
-        const restTokens = tokenizeRaw(rest)
-        if (restTokens.length && restTokens.every(t => NOISE_WORDS.has(t))) {
-          if (first.length >= 3) best = first
+        const restTokens = tokenizeRaw(parts.slice(1).join(" ").toLowerCase())
+        if (restTokens.length && restTokens.every(t => NOISE_WORDS.has(t)) && first.length >= 3) {
+          return first
         }
       }
     }
   }
-  return best
+  return title
 }
 
-/* Artist - Title 形式などの前処理 */
 function escapeRegex(s: string) {
   return s.replace(/[.*+?^${}()|[\]\\]/g,"\\$&")
 }
+
 function preNormalizeTitle(raw: string, artist: string): string {
   let t = normalizeJapaneseBrackets(normalizeQuotes(raw))
   const artistLc = artist.trim().toLowerCase()
   if (artistLc) {
-    const sepRegex = new RegExp(`^\\s*(${escapeRegex(artistLc)})\\s*[-–—/:|]\\s*(.+)$`,"i")
-    const m = t.match(sepRegex)
+    let reg = ARTIST_PREFIX_REGEX_PARTS_CACHE.get(artistLc)
+    if (!reg) {
+      reg = new RegExp(`^\\s*(${escapeRegex(artistLc)})\\s*[-–—/:|]\\s*(.+)$`,"i")
+      ARTIST_PREFIX_REGEX_PARTS_CACHE.set(artistLc, reg)
+    }
+    const m = t.match(reg)
     if (m) t = m[2]
   }
-  t = t.replace(/\bby\s+[a-z0-9 .'\-]+(\s+of\s+[a-z0-9 .'\-]+)?$/i,"").trim()
-  return t
+  return t.replace(/\bby\s+[a-z0-9 .'\-]+(\s+of\s+[a-z0-9 .'\-]+)?$/i,"").trim()
 }
 
-/* スラッシュ/縦線 分割 (メドレー等) */
 function splitTitleFragments(title: string): string[] {
-  const sep = /\s*[\/／｜|]\s*/
-  if (!sep.test(title)) return [title]
-  return title.split(sep).filter(p => p.trim().length > 0)
+  return /\s*[\/／｜|]\s*/.test(title)
+    ? title.split(/\s*[\/／｜|]\s*/).filter(p => p.trim().length > 0)
+    : [title]
 }
 
 function basicCleanTitle(raw: string): string {
-  let t = raw
-  t = stripBracketedNoise(t)
+  let t = stripBracketedNoise(raw)
   t = removeMatchedParens(t)
   t = dashTruncateIfNoise(t)
-  // 重複除去は既存仕様維持（“danger danger” 問題を避けたいなら別 variant 追加で対応）
   const toks = tokenizeRaw(t)
+  if (toks.length <= 1) return toks.join(" ")
   const dedup: string[] = []
   const seen = new Set<string>()
   for (const tk of toks) {
@@ -231,20 +229,17 @@ function extractCoreTitle(raw: string): CoverExtraction {
     }
   }
   work = work.replace(/\bcover\s*$/i, () => { coverDetected = true; return "" }).trim()
-  work = normalizeSpaces(work)
-  return { coverDetected, coreTitle: work, originalRaw: raw }
+  return { coverDetected, coreTitle: normalizeSpaces(work), originalRaw: raw }
 }
 
-/* ================ Descriptor / feat variants ================ */
+/* ================ Descriptor / feat 処理（厳密用） ================ */
 function extractDescriptorBase(text: string): string {
   let out = text.replace(/\(([^)]*)\)/g, (m, inner) => {
     const innerTrim = String(inner).trim()
     if (!innerTrim) return " "
     if (bracketInnerShouldRemove(innerTrim)) return " "
     const innerTokens = tokenizeRaw(innerTrim)
-    if (innerTokens.length && innerTokens.every(t => DESCRIPTOR_KEYWORDS.has(t) || NOISE_WORDS.has(t))) {
-      return " "
-    }
+    if (innerTokens.length && innerTokens.every(t => DESCRIPTOR_KEYWORDS.has(t) || NOISE_WORDS.has(t))) return " "
     return m
   })
   const toks = tokenizeRaw(out)
@@ -253,63 +248,11 @@ function extractDescriptorBase(text: string): string {
     if (DESCRIPTOR_KEYWORDS.has(last) || NOISE_WORDS.has(last)) { toks.pop(); continue }
     break
   }
-  out = toks.join(" ")
-  return normalizeSpaces(out)
+  return normalizeSpaces(toks.join(" "))
 }
 
-function generateTitleVariants(raw: string): string[] {
-  const set = new Set<string>()
-  const cleaned = basicCleanTitle(raw)
-  set.add(cleaned)
-
-  const noFeat = cleaned.replace(/\b(feat|ft|featuring|with)\b.*$/i, "").trim()
-  if (noFeat && noFeat !== cleaned) set.add(noFeat)
-
-  const descBase = extractDescriptorBase(cleaned)
-  if (descBase && descBase !== cleaned) set.add(descBase)
-
-  if (noFeat) {
-    const noFeatDesc = extractDescriptorBase(noFeat)
-    if (noFeatDesc && noFeatDesc !== noFeat) set.add(noFeatDesc)
-  }
-
-  const noEngParen = cleaned
-    .replace(/\([A-Za-z0-9 ,.'&\-]+\)/g, " ")
-    .replace(/\s+/g," ").trim()
-  if (noEngParen && !set.has(noEngParen)) set.add(noEngParen)
-
-  const noEngDesc = extractDescriptorBase(noEngParen)
-  if (noEngDesc && !set.has(noEngDesc)) set.add(noEngDesc)
-
-  // 末尾 descriptor/ノイズ語を段階的に落として追加
-  const toks = tokenizeRaw(cleaned)
-  for (let i = toks.length; i > 1; i--) {
-    const head = toks.slice(0,i)
-    const last = head[head.length-1]
-    if (DESCRIPTOR_KEYWORDS.has(last) || NOISE_WORDS.has(last)) {
-      const variant = head.slice(0,-1).join(" ")
-      if (variant.length > 1) set.add(variant)
-    }
-  }
-
-  // オリジナルトークン順保持 (重複含む) も variant に
-  const origTokens = tokenizeRaw(raw)
-  if (origTokens.length) {
-    const originalSeq = origTokens.join(" ")
-    set.add(originalSeq)
-  }
-
-  return [...set].filter(v => v.length > 0)
-}
-
-function removeDescriptorsTokens(tokens: string[]) {
-  return tokens.filter(t => !DESCRIPTOR_KEYWORDS.has(t))
-}
-function tokensWithoutFeatWords(tokens: string[]) {
-  return tokens.filter(t => !FEAT_WORDS.has(t))
-}
-
-/* ================ Artist match (simple) ================ */
+/* ================ Artist match (cached) ================ */
+const artistMatchCache = new Map<string, boolean>()
 function artistVariants(name: string): string[] {
   const v = new Set<string>()
   const trimmed = name.trim()
@@ -317,97 +260,74 @@ function artistVariants(name: string): string[] {
   const parens = name.match(/\(([^)]*)\)/g)
   if (parens) {
     for (const p of parens) {
-      const inner = p.replace(/[()]/g,"").trim().toLowerCase()
+      const inner = p.slice(1,-1).trim().toLowerCase()
       if (inner) v.add(inner)
     }
   }
-  const noParen = name.replace(/\([^)]*\)/g," ").replace(/\s+/g," ").trim().toLowerCase()
+  const noParen = name.replace(/\([^)]*\)/g," ").replace(MULTI_SPACES_REGEX," ").trim().toLowerCase()
   if (noParen) v.add(noParen)
   return [...v]
 }
 
 function artistRoughMatch(queryArtist: string, candidateArtist: string) {
+  const key = queryArtist + "||" + candidateArtist
+  if (artistMatchCache.has(key)) return artistMatchCache.get(key)!
   const qVars = artistVariants(queryArtist)
   const cVars = artistVariants(candidateArtist)
   for (const qa of qVars) {
+    const qs = stripPunctLower(qa)
+    if (!qs) continue
     for (const ca of cVars) {
-      const qs = stripPunctLower(qa)
       const cs = stripPunctLower(ca)
-      if (!qs || !cs) continue
-      if (qs === cs) return true
-      if ((qs.length >= 3 && cs.includes(qs)) || (cs.length >= 3 && qs.includes(cs))) return true
+      if (!cs) continue
+      if (qs === cs) { artistMatchCache.set(key,true); return true }
+      if ((qs.length >= 3 && cs.includes(qs)) || (cs.length >= 3 && qs.includes(cs))) { artistMatchCache.set(key,true); return true }
       const qTokens = tokenizeForMatch(qa)
       const cTokens = tokenizeForMatch(ca)
       if (qTokens.length && cTokens.length) {
-        const shared = qTokens.filter(t => cTokens.includes(t))
-        if (shared.length > 0) return true
+        for (const t of qTokens) {
+          if (cTokens.includes(t)) { artistMatchCache.set(key,true); return true }
+        }
       }
     }
   }
-  return false
-}
-
-/* ================ Title match ================ */
-function hasBadWord(candidateTitle: string, originalTitle: string) {
-  const c = candidateTitle.toLowerCase()
-  const o = originalTitle.toLowerCase()
-  for (const w of BAD_WORDS) {
-    if (c.includes(w) && !o.includes(w)) return true
+  artistMatchCache.set(key,false)
+  // 簡易 LRU: サイズ超過時に先頭要素削除
+  if (artistMatchCache.size > 512) {
+    const firstKey = artistMatchCache.keys().next().value
+    artistMatchCache.delete(firstKey)
   }
   return false
 }
 
+/* ================ Title match (strict with cache) ================ */
 function removeParentheticalRomanization(s: string): string {
-  // 括弧内が翻訳/ローマ字/英訳系なら削除 (キーワード拡張)
   return s.replace(/\(([^(]*?(?:english|translation|romanized|romaji|transliteration)[^)]*)\)/gi," ")
-          .replace(/\s+/g," ").trim()
+          .replace(MULTI_SPACES_REGEX," ").trim()
 }
 
-function coreDescriptorAgnosticTokens(tokens: string[]) {
-  return tokens.filter(t => !DESCRIPTOR_KEYWORDS.has(t) && !NOISE_WORDS.has(t))
+const canonicalCache = new Map<string,string>()
+function canonicalBase(raw: string): string {
+  if (!raw) return ""
+  if (canonicalCache.has(raw)) return canonicalCache.get(raw)!
+  let t = basicCleanTitle(raw)
+  t = t.replace(/\b(feat|ft|featuring|with)\b.*$/i,"").trim()
+  const desc = extractDescriptorBase(t)
+  if (desc) t = desc
+  t = removeParentheticalRomanization(t)
+  t = stripPunctLower(t.normalize("NFKC"))
+  canonicalCache.set(raw, t)
+  if (canonicalCache.size > 512) {
+    const fk = canonicalCache.keys().next().value
+    canonicalCache.delete(fk)
+  }
+  return t
 }
 
 function titleLikelySame(a: string, b: string) {
-  const av = generateTitleVariants(a)
-  const bv = generateTitleVariants(b)
-  const extraA = new Set<string>()
-  const extraB = new Set<string>()
-  av.forEach(v => extraA.add(removeParentheticalRomanization(v)))
-  bv.forEach(v => extraB.add(removeParentheticalRomanization(v)))
-  const allA = [...new Set([...av, ...extraA])]
-  const allB = [...new Set([...bv, ...extraB])]
-
-  for (const x of allA) {
-    for (const y of allB) {
-      if (!x || !y) continue
-      if (x.toLowerCase() === y.toLowerCase()) return true
-
-      const xTokens = tokenizeForMatch(x)
-      const yTokens = tokenizeForMatch(y)
-      if (!xTokens.length || !yTokens.length) continue
-
-      const xCore = tokensWithoutFeatWords(removeDescriptorsTokens(xTokens))
-      const yCore = tokensWithoutFeatWords(removeDescriptorsTokens(yTokens))
-      const X = xCore.length ? xCore : xTokens
-      const Y = yCore.length ? yCore : yTokens
-
-      const XD = coreDescriptorAgnosticTokens(X)
-      const YD = coreDescriptorAgnosticTokens(Y)
-      const sharedD = XD.filter(t => YD.includes(t))
-      if (sharedD.length && sharedD.length === Math.min(XD.length, YD.length)) return true
-
-      const shared = X.filter(t => Y.includes(t))
-      const minLen = Math.min(X.length, Y.length)
-      if (shared.length === minLen && minLen >= 1) return true
-      const overlap = shared.length / (minLen || 1)
-      if (overlap >= MIN_TOKEN_OVERLAP) return true
-
-      const xs = stripPunctLower(x)
-      const ys = stripPunctLower(y)
-      if (xs.includes(ys) || ys.includes(xs)) return true
-    }
-  }
-  return false
+  const ca = canonicalBase(a)
+  const cb = canonicalBase(b)
+  return !!ca && ca === cb
 }
 
 /* ================ Genius API ================ */
@@ -421,6 +341,16 @@ async function geniusSearch(q: string) {
 }
 
 interface MatchResult { url: string | null; debug?: any }
+
+/* ================ Helpers ================ */
+function hasBadWord(candidateTitle: string, originalTitle: string) {
+  const c = candidateTitle.toLowerCase()
+  const o = originalTitle.toLowerCase()
+  for (const w of BAD_WORDS) {
+    if (c.includes(w) && !o.includes(w)) return true
+  }
+  return false
+}
 
 /* ================ Matching core ================ */
 async function findGeniusUrl(title: string, artist: string, debug: boolean): Promise<MatchResult> {
@@ -444,13 +374,10 @@ async function findGeniusUrl(title: string, artist: string, debug: boolean): Pro
 
   const queries: { label: string; q: string }[] = []
   queries.push({ label: "raw", q: `${title} ${artist}` })
-
   if (normalizedTitle !== title) queries.push({ label: "pre_norm", q: `${normalizedTitle} ${artist}` })
   if (cleaned !== normalizedTitle) queries.push({ label: "cleaned", q: `${cleaned} ${artist}` })
   if (dashReduced !== cleaned) queries.push({ label: "dash_reduced", q: `${dashReduced} ${artist}` })
-  if (descriptorBase && descriptorBase !== cleaned) {
-    queries.push({ label: "no_descriptor", q: `${descriptorBase} ${artist}` })
-  }
+  if (descriptorBase && descriptorBase !== cleaned) queries.push({ label: "no_descriptor", q: `${descriptorBase} ${artist}` })
   if (coverDetected) {
     if (coreTitle && coreTitle !== cleaned) {
       queries.push({ label: "cover_core", q: `${coreTitle} ${artist}` })
@@ -464,34 +391,41 @@ async function findGeniusUrl(title: string, artist: string, debug: boolean): Pro
   }
   queries.push({ label: "title_only_final", q: baseTitle })
 
-  fragmentCores.forEach((fc, idx) => {
+  for (let i = 0; i < fragmentCores.length; i++) {
+    const fc = fragmentCores[i]
     if (fc !== baseTitle) {
-      queries.push({ label: `fragment_${idx}`, q: `${fc} ${artist}` })
-      queries.push({ label: `fragment_${idx}_title_only`, q: fc })
+      queries.push({ label: `fragment_${i}`, q: `${fc} ${artist}` })
+      queries.push({ label: `fragment_${i}_title_only`, q: fc })
     }
-  })
+  }
 
+  // 重複除去
   const seen = new Set<string>()
-  const finalQueries = queries.filter(q => {
+  const finalQueries: { label: string; q: string }[] = []
+  for (const q of queries) {
     const k = q.q.toLowerCase()
-    if (seen.has(k)) return false
+    if (seen.has(k)) continue
     seen.add(k)
-    return true
-  })
+    finalQueries.push(q)
+  }
 
   const debugLogs: any[] = []
   let acceptedGlobal: any = null
   let penalizedFallback: any = null
 
   const origLower = title.toLowerCase()
+  const queryCanonical = canonicalBase(title)
 
   for (const q of finalQueries) {
     let hits: any[] = []
-    try { hits = await geniusSearch(q.q) } catch { /* ignore */ }
+    try {
+      hits = await geniusSearch(q.q)
+    } catch {
+      /* ignore network errors */
+    }
 
     const examined: any[] = []
     let acceptedInQuery: any = null
-    penalizedFallback = penalizedFallback
 
     for (const h of hits) {
       const r = h.result
@@ -504,14 +438,13 @@ async function findGeniusUrl(title: string, artist: string, debug: boolean): Pro
         examined.push({ id: r.id, title: cTitle, artist: cArtist, decision: reasons.join("|") })
         continue
       }
-
       if (hasBadWord(cTitle, title)) {
         reasons.push("reject:bad_word")
         examined.push({ id: r.id, title: cTitle, artist: cArtist, decision: reasons.join("|") })
         continue
       }
 
-      const needArtist = !q.label.endsWith("title_only") && !q.label.includes("title_only")
+      const needArtist = !(q.label.includes("title_only"))
       if (needArtist && !artistRoughMatch(artist, cArtist)) {
         reasons.push("reject:artist_mismatch")
         examined.push({ id: r.id, title: cTitle, artist: cArtist, decision: reasons.join("|") })
@@ -521,23 +454,21 @@ async function findGeniusUrl(title: string, artist: string, debug: boolean): Pro
       const cLower = cTitle.toLowerCase()
       let isPenalized = false
       if (!ROMANIZED_MARKERS.some(m => origLower.includes(m))) {
-        if (ROMANIZED_MARKERS.some(m => cLower.includes(m))) {
-          isPenalized = true
-        }
+        if (ROMANIZED_MARKERS.some(m => cLower.includes(m))) isPenalized = true
       }
 
-      const same =
-        titleLikelySame(title, cTitle) ||
-        titleLikelySame(normalizedTitle, cTitle) ||
-        (coreTitle && titleLikelySame(coreTitle, cTitle)) ||
-        (descriptorBase && titleLikelySame(descriptorBase, cTitle)) ||
-        (baseTitle && titleLikelySame(baseTitle, cTitle))
-
+      const candidateCanonical = canonicalBase(cTitle)
+      const same = queryCanonical && candidateCanonical && queryCanonical === candidateCanonical
       if (!same) {
-        reasons.push("reject:title_mismatch")
+        reasons.push("reject:title_mismatch_strict")
         examined.push({
-          id: r.id, title: cTitle, artist: cArtist,
-          decision: reasons.join("|"), penalized: isPenalized
+          id: r.id,
+            title: cTitle,
+            artist: cArtist,
+            decision: reasons.join("|"),
+            penalized: isPenalized,
+            canonical_query: queryCanonical,
+            canonical_candidate: candidateCanonical
         })
         continue
       }
@@ -551,7 +482,9 @@ async function findGeniusUrl(title: string, artist: string, debug: boolean): Pro
           url: r.url,
           decision: reasons.join("|"),
           usedQuery: q.label,
-          penalized: true
+          penalized: true,
+          canonical_query: queryCanonical,
+          canonical_candidate: candidateCanonical
         }
         examined.push(penal)
         if (!penalizedFallback) penalizedFallback = penal
@@ -566,7 +499,9 @@ async function findGeniusUrl(title: string, artist: string, debug: boolean): Pro
         url: r.url,
         decision: reasons.join("|"),
         usedQuery: q.label,
-        penalized: false
+        penalized: false,
+        canonical_query: queryCanonical,
+        canonical_candidate: candidateCanonical
       }
       examined.push(acceptedInQuery)
       break
@@ -594,6 +529,8 @@ async function findGeniusUrl(title: string, artist: string, debug: boolean): Pro
       descriptorBase,
       baseTitle,
       fragments: fragmentCores,
+      strictMode: true,
+      canonical_query: queryCanonical,
       steps: debugLogs
     } : undefined
   }
