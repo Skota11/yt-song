@@ -2,7 +2,7 @@ import { Hono } from 'https://deno.land/x/hono/mod.ts'
 import { cors } from 'https://deno.land/x/hono/middleware.ts'
 import ytdl from "npm:@distube/ytdl-core"
 
-/* ================= Config ================= */
+/* ================= Config (minimal + descriptor & cover) ================= */
 const geniusToken = Deno.env.get("GENIUS_ACCESS_TOKEN")
 
 const BAD_WORDS = [
@@ -19,7 +19,7 @@ const STOPWORDS = new Set([...NOISE_WORDS])
 const MIN_TOKEN_OVERLAP = 0.6
 const DASH_SPLIT_SEPARATORS = [" - ", " | "]
 
-/* --- Cover detection patterns --- */
+/* Cover detection */
 const COVER_MARKERS = /(歌ってみた|covered?\s+by|cover\s+by|カバー|cover)/i
 const COVER_REMOVE_PATTERNS: RegExp[] = [
   /\bcovered?\s+by\s+[^\s].*$/i,
@@ -29,12 +29,37 @@ const COVER_REMOVE_PATTERNS: RegExp[] = [
   /歌ってみた.*$/i
 ]
 
-/* --- NEW: feat 判定語 --- */
-const FEAT_WORDS = new Set(["feat","ft","featuring"])
+/* feat / descriptor */
+/* CHANGED: add "original" so (Original Instrumental) 全体を descriptor 括弧として扱える */
+const FEAT_WORDS = new Set(["feat","ft","featuring","with"])
+const DESCRIPTOR_KEYWORDS = new Set([
+  "instrumental","inst","offvocal","off-vocal","acoustic","acapella","a","cappella",
+  "karaoke","カラオケ","カラオケver","カラオケversion","カラオケ音源",
+  "original" // added
+])
 
-/* ================ Utility: Normalization ================ */
+/* ================ Utility ================ */
 function normalizeSpaces(s: string) {
   return s.replace(/\s+/g," ").trim()
+}
+
+function tokenizeRaw(s: string) {
+  return s
+    .toLowerCase()
+    .normalize("NFKC")
+    .replace(/[“”"’']/g," ")
+    .replace(/[#(){}]/g," ")
+    .split(/[\s\-_:/|.,!?]+/)
+    .map(t=>t.trim())
+    .filter(Boolean)
+}
+
+function tokenizeForMatch(s: string) {
+  return tokenizeRaw(s).filter(t => !STOPWORDS.has(t) && !/^\d+$/.test(t))
+}
+
+function stripPunctLower(s: string) {
+  return s.toLowerCase().replace(/[\s'"!?:.,\-–—_]/g,"")
 }
 
 function stripBracketedNoise(title: string): string {
@@ -92,41 +117,14 @@ function basicCleanTitle(raw: string): string {
   return dedup.join(" ")
 }
 
-function tokenizeRaw(s: string) {
-  return s
-    .toLowerCase()
-    .normalize("NFKC")
-    .replace(/[“”"’']/g," ")
-    .replace(/[#(){}]/g," ")
-    .split(/[\s\-_:/|.,!?]+/)
-    .map(t=>t.trim())
-    .filter(Boolean)
-}
-
-function tokenizeForMatch(s: string) {
-  return tokenizeRaw(s).filter(t => !STOPWORDS.has(t) && !/^\d+$/.test(t))
-}
-
-function stripPunctLower(s: string) {
-  return s.toLowerCase().replace(/[\s'"!?:.,\-–—_]/g,"")
-}
-
-/* ================ Cover Title Extraction ================ */
-interface CoverExtraction {
-  coverDetected: boolean
-  coreTitle: string
-  originalRaw: string
-}
-
+/* ================ Cover extraction ================ */
+interface CoverExtraction { coverDetected: boolean; coreTitle: string; originalRaw: string }
 function extractCoreTitle(raw: string): CoverExtraction {
   let work = raw
   let coverDetected = false
 
   work = work.replace(/^[【\[]([^】\]]+)[】\]]\s*/g, (_m, inner) => {
-    if (COVER_MARKERS.test(inner)) {
-      coverDetected = true
-      return ""
-    }
+    if (COVER_MARKERS.test(inner)) { coverDetected = true; return "" }
     return _m
   })
 
@@ -137,98 +135,99 @@ function extractCoreTitle(raw: string): CoverExtraction {
     }
   }
 
-  work = work.replace(/\bcover\s*$/i, () => {
-    coverDetected = true
-    return ""
-  }).trim()
-
+  work = work.replace(/\bcover\s*$/i, () => { coverDetected = true; return "" }).trim()
   work = normalizeSpaces(work)
 
-  return {
-    coverDetected,
-    coreTitle: work,
-    originalRaw: raw
-  }
+  return { coverDetected, coreTitle: work, originalRaw: raw }
 }
 
-/* ================ Artist Matching (dynamic only) ================ */
-function artistVariants(name: string): string[] {
-  const variants = new Set<string>()
-  const trimmed = name.trim()
-  if (trimmed) variants.add(trimmed.toLowerCase())
+/* ================ Descriptor / feat variants ================ */
+function extractDescriptorBase(text: string): string {
+  let out = text.replace(/\(([^)]*)\)/g, (m, inner) => {
+    const innerTokens = tokenizeRaw(inner)
+    if (innerTokens.length && innerTokens.every(t => DESCRIPTOR_KEYWORDS.has(t))) {
+      return " "
+    }
+    return m
+  })
+  const toks = tokenizeRaw(out)
+  while (toks.length) {
+    const last = toks[toks.length - 1]
+    if (DESCRIPTOR_KEYWORDS.has(last)) { toks.pop(); continue }
+    break
+  }
+  out = toks.join(" ")
+  return normalizeSpaces(out)
+}
 
+function generateTitleVariants(raw: string): string[] {
+  const set = new Set<string>()
+  const cleaned = basicCleanTitle(raw)
+  set.add(cleaned)
+
+  const noFeat = cleaned.replace(/\b(feat|ft|featuring|with)\b.*$/i, "").trim()
+  if (noFeat && noFeat !== cleaned) set.add(noFeat)
+
+  const noEngParen = cleaned.replace(/\([A-Za-z0-9 ,.'&\-]+\)/g, " ").replace(/\s+/g," ").trim()
+  if (noEngParen && !set.has(noEngParen)) set.add(noEngParen)
+
+  const descBase = extractDescriptorBase(cleaned)
+  if (descBase && !set.has(descBase)) set.add(descBase)
+
+  const noFeatDesc = extractDescriptorBase(noFeat)
+  if (noFeatDesc && !set.has(noFeatDesc)) set.add(noFeatDesc)
+
+  const noEngDesc = extractDescriptorBase(noEngParen)
+  if (noEngDesc && !set.has(noEngDesc)) set.add(noEngDesc)
+
+  return [...set].filter(v => v.length > 0)
+}
+
+function removeDescriptorsTokens(tokens: string[]) {
+  return tokens.filter(t => !DESCRIPTOR_KEYWORDS.has(t))
+}
+function tokensWithoutFeatWords(tokens: string[]) {
+  return tokens.filter(t => !FEAT_WORDS.has(t))
+}
+
+/* ================ Artist match (simple) ================ */
+function artistVariants(name: string): string[] {
+  const v = new Set<string>()
+  const trimmed = name.trim()
+  if (trimmed) v.add(trimmed.toLowerCase())
   const parens = name.match(/\(([^)]*)\)/g)
   if (parens) {
     for (const p of parens) {
       const inner = p.replace(/[()]/g,"").trim().toLowerCase()
-      if (inner) variants.add(inner)
+      if (inner) v.add(inner)
     }
   }
   const noParen = name.replace(/\([^)]*\)/g," ").replace(/\s+/g," ").trim().toLowerCase()
-  if (noParen) variants.add(noParen)
-
-  return Array.from(variants)
+  if (noParen) v.add(noParen)
+  return [...v]
 }
-
 function artistRoughMatch(queryArtist: string, candidateArtist: string) {
   const qVars = artistVariants(queryArtist)
   const cVars = artistVariants(candidateArtist)
-
-  for (const qv of qVars) {
-    for (const cv of cVars) {
-      if (!qv || !cv) continue
-      const qStr = stripPunctLower(qv)
-      const cStr = stripPunctLower(cv)
-      if (!qStr || !cStr) continue
-
-      if (qStr === cStr) return true
-      if ((qStr.length >= 3 && cStr.includes(qStr)) || (cStr.length >= 3 && qStr.includes(cStr))) return true
-
-      const qTokens = tokenizeForMatch(qv)
-      const cTokens = tokenizeForMatch(cv)
+  for (const qa of qVars) {
+    for (const ca of cVars) {
+      const qs = stripPunctLower(qa)
+      const cs = stripPunctLower(ca)
+      if (!qs || !cs) continue
+      if (qs === cs) return true
+      if ((qs.length >= 3 && cs.includes(qs)) || (cs.length >= 3 && qs.includes(cs))) return true
+      const qTokens = tokenizeForMatch(qa)
+      const cTokens = tokenizeForMatch(ca)
       if (qTokens.length && cTokens.length) {
         const shared = qTokens.filter(t => cTokens.includes(t))
         if (shared.length > 0) return true
-      }
-
-      if (qStr.length <= 6 || cStr.length <= 6) {
-        if (cStr.startsWith(qStr) || cStr.endsWith(qStr) || qStr.startsWith(cStr) || qStr.endsWith(cStr)) {
-          return true
-        }
       }
     }
   }
   return false
 }
 
-/* ================ NEW: Title Variants (feat/英語括弧無視) ================ */
-function generateTitleVariants(raw: string): string[] {
-  const variants = new Set<string>()
-  const cleaned = basicCleanTitle(raw)
-  variants.add(cleaned)
-
-  // feat 部分を落とす
-  const noFeat = cleaned.replace(/\b(feat|ft|featuring)\b.*$/i, "").trim()
-  if (noFeat && noFeat !== cleaned) variants.add(noFeat)
-
-  // 英語のみ括弧 (translation / romaji っぽい) を削除
-  const noEngParen = cleaned.replace(/\([A-Za-z0-9 ,.'&\-]+\)/g, " ").replace(/\s+/g," ").trim()
-  if (noEngParen && !variants.has(noEngParen)) variants.add(noEngParen)
-
-  // 両方適用（順序関係あるので再度）
-  const noFeatNoEngParen = noFeat
-    .replace(/\([A-Za-z0-9 ,.'&\-]+\)/g, " ")
-    .replace(/\s+/g," ").trim()
-  if (noFeatNoEngParen && !variants.has(noFeatNoEngParen)) variants.add(noFeatNoEngParen)
-
-  return Array.from(variants).filter(v => v.length > 0)
-}
-
-function tokensWithoutFeatWords(tokens: string[]) {
-  return tokens.filter(t => !FEAT_WORDS.has(t))
-}
-
-/* ================ Title Matching (with variants) ================ */
+/* ================ Title match ================ */
 function hasBadWord(candidateTitle: string, originalTitle: string) {
   const c = candidateTitle.toLowerCase()
   const o = originalTitle.toLowerCase()
@@ -237,45 +236,27 @@ function hasBadWord(candidateTitle: string, originalTitle: string) {
   }
   return false
 }
-
-/**
- * 変更点:
- *  - 両タイトルのバリアント生成
- *  - 各組合せで従来の一致基準 (完全一致 / overlap / 包含) を評価
- *  - overlap は feat 語と英訳括弧除去後の token set でも再計算
- */
-function titleLikelySame(origTitle: string, candTitle: string) {
-  const origVariants = generateTitleVariants(origTitle)
-  const candVariants = generateTitleVariants(candTitle)
-
-  for (const ov of origVariants) {
-    for (const cv of candVariants) {
-      if (ov.toLowerCase() === cv.toLowerCase()) return true
-
-      const oTokens = tokenizeForMatch(ov)
-      const cTokens = tokenizeForMatch(cv)
-      if (!oTokens.length || !cTokens.length) continue
-
-      const oCore = tokensWithoutFeatWords(oTokens)
-      const cCore = tokensWithoutFeatWords(cTokens)
-
-      // コアが空になった場合 fallback
-      const oUse = oCore.length ? oCore : oTokens
-      const cUse = cCore.length ? cCore : cTokens
-
-      const shared = oUse.filter(t => cUse.includes(t))
-      const minLen = Math.min(oUse.length, cUse.length)
-      const overlap = shared.length / (minLen || 1)
-
-      if (overlap >= MIN_TOKEN_OVERLAP) return true
-
-      // subset（小さい方の全トークンがもう片方に含まれる）
+function titleLikelySame(a: string, b: string) {
+  const av = generateTitleVariants(a)
+  const bv = generateTitleVariants(b)
+  for (const x of av) {
+    for (const y of bv) {
+      if (x.toLowerCase() === y.toLowerCase()) return true
+      const xTokens = tokenizeForMatch(x)
+      const yTokens = tokenizeForMatch(y)
+      if (!xTokens.length || !yTokens.length) continue
+      const xCore = tokensWithoutFeatWords(removeDescriptorsTokens(xTokens))
+      const yCore = tokensWithoutFeatWords(removeDescriptorsTokens(yTokens))
+      const X = xCore.length ? xCore : xTokens
+      const Y = yCore.length ? yCore : yTokens
+      const shared = X.filter(t => Y.includes(t))
+      const minLen = Math.min(X.length, Y.length)
       if (shared.length === minLen && minLen >= 1) return true
-
-      // 文字列包含
-      const oStr = stripPunctLower(ov)
-      const cStr = stripPunctLower(cv)
-      if (oStr.includes(cStr) || cStr.includes(oStr)) return true
+      const overlap = shared.length / (minLen || 1)
+      if (overlap >= MIN_TOKEN_OVERLAP) return true
+      const xs = stripPunctLower(x)
+      const ys = stripPunctLower(y)
+      if (xs.includes(ys) || ys.includes(xs)) return true
     }
   }
   return false
@@ -291,47 +272,58 @@ async function geniusSearch(q: string) {
   return json.response?.hits || []
 }
 
-/* ================ Matching Core ================ */
-interface MatchResult {
-  url: string | null
-  debug?: any
-}
+/* ================ Matching core ================ */
+interface MatchResult { url: string | null; debug?: any }
 
 async function findGeniusUrl(title: string, artist: string, debug: boolean): Promise<MatchResult> {
   if (!geniusToken) return { url: null, debug: debug ? { reason: "no_token" } : undefined }
 
-  const cleanedTitle = basicCleanTitle(title)
-  const dashReduced = dashTruncateIfNoise(cleanedTitle)
-  const { coverDetected, coreTitle } = extractCoreTitle(cleanedTitle)
+  const cleaned = basicCleanTitle(title)
+  const dashReduced = dashTruncateIfNoise(cleaned)
+  const { coverDetected, coreTitle } = extractCoreTitle(cleaned)
+  const descriptorBase = extractDescriptorBase(cleaned)
+
+  const baseTitle = extractDescriptorBase(
+    cleaned.replace(/\b(feat|ft|featuring|with)\b.*$/i,"").trim()
+  ) || cleaned
 
   const queries: { label: string; q: string }[] = []
   queries.push({ label: "raw", q: `${title} ${artist}` })
-  if (cleanedTitle !== title) queries.push({ label: "cleaned", q: `${cleanedTitle} ${artist}` })
-  if (dashReduced !== cleanedTitle) queries.push({ label: "dash_reduced", q: `${dashReduced} ${artist}` })
-
+  if (cleaned !== title) queries.push({ label: "cleaned", q: `${cleaned} ${artist}` })
+  if (dashReduced !== cleaned) queries.push({ label: "dash_reduced", q: `${dashReduced} ${artist}` })
+  if (descriptorBase && descriptorBase !== cleaned) {
+    queries.push({ label: "no_descriptor", q: `${descriptorBase} ${artist}` })
+  }
   if (coverDetected) {
-    if (coreTitle && coreTitle !== cleanedTitle) {
+    if (coreTitle && coreTitle !== cleaned) {
       queries.push({ label: "cover_core", q: `${coreTitle} ${artist}` })
       queries.push({ label: "cover_core_title_only", q: coreTitle })
     } else {
-      queries.push({ label: "cover_title_only", q: cleanedTitle })
+      queries.push({ label: "cover_title_only", q: cleaned })
     }
   }
+  if (descriptorBase && descriptorBase !== cleaned) {
+    queries.push({ label: "no_descriptor_title_only", q: descriptorBase })
+  }
+  queries.push({ label: "title_only_final", q: baseTitle })
+
+  const seen = new Set<string>()
+  const finalQueries = queries.filter(q => {
+    const k = q.q.toLowerCase()
+    if (seen.has(k)) return false
+    seen.add(k)
+    return true
+  })
 
   const debugLogs: any[] = []
   let acceptedGlobal: any = null
 
-  for (const q of queries) {
+  for (const q of finalQueries) {
     let hits: any[] = []
-    try {
-      hits = await geniusSearch(q.q)
-    } catch {
-      continue
-    }
+    try { hits = await geniusSearch(q.q) } catch { /* ignore */ }
 
     let accepted: any = null
     const examined: any[] = []
-
     for (const h of hits) {
       const r = h.result
       const cTitle = r.title || r.full_title || ""
@@ -344,16 +336,19 @@ async function findGeniusUrl(title: string, artist: string, debug: boolean): Pro
         continue
       }
 
-      const needArtistMatch = !q.label.endsWith("title_only")
-      if (needArtistMatch && !artistRoughMatch(artist, cArtist)) {
+      const needArtist = !q.label.endsWith("title_only") && !q.label.includes("title_only")
+      if (needArtist && !artistRoughMatch(artist, cArtist)) {
         reasons.push("reject:artist_mismatch")
         examined.push({ id: r.id, title: cTitle, artist: cArtist, decision: reasons.join("|") })
         continue
       }
 
-      // coreTitle も fallback としてチェック
-      if (!titleLikelySame(title, cTitle) &&
-          !(coreTitle && titleLikelySame(coreTitle, cTitle))) {
+      if (
+        !titleLikelySame(title, cTitle) &&
+        !(coreTitle && titleLikelySame(coreTitle, cTitle)) &&
+        !(descriptorBase && titleLikelySame(descriptorBase, cTitle)) &&
+        !(baseTitle && titleLikelySame(baseTitle, cTitle))
+      ) {
         reasons.push("reject:title_mismatch")
         examined.push({ id: r.id, title: cTitle, artist: cArtist, decision: reasons.join("|") })
         continue
@@ -373,10 +368,7 @@ async function findGeniusUrl(title: string, artist: string, debug: boolean): Pro
     }
 
     debugLogs.push({ query: q, examined })
-    if (accepted) {
-      acceptedGlobal = accepted
-      break
-    }
+    if (accepted) { acceptedGlobal = accepted; break }
   }
 
   return {
@@ -385,12 +377,14 @@ async function findGeniusUrl(title: string, artist: string, debug: boolean): Pro
       accepted: acceptedGlobal,
       coverDetected,
       coreTitle,
+      descriptorBase,
+      baseTitle,
       steps: debugLogs
     } : undefined
   }
 }
 
-/* ================ Route ================ */
+/* ================ HTTP route ================ */
 const app = new Hono()
 app.use("/", cors())
 
@@ -408,14 +402,11 @@ app.get("/track", async (c) => {
   }
 
   const engagementPanel = info.response?.engagementPanels?.find((d: any) =>
-    d.engagementPanelSectionListRenderer?.panelIdentifier ===
-    "engagement-panel-structured-description"
+    d.engagementPanelSectionListRenderer?.panelIdentifier === "engagement-panel-structured-description"
   )
 
   const songsSection = engagementPanel?.engagementPanelSectionListRenderer?.content
-    ?.structuredDescriptionContentRenderer?.items?.find((d: any) =>
-      d.horizontalCardListRenderer !== undefined
-    )
+    ?.structuredDescriptionContentRenderer?.items?.find((d: any) => d.horizontalCardListRenderer !== undefined)
 
   if (!songsSection) return c.json({ song: false })
 
