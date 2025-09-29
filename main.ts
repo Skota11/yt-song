@@ -2,36 +2,27 @@ import { Hono } from 'https://deno.land/x/hono/mod.ts'
 import { cors } from 'https://deno.land/x/hono/middleware.ts'
 import ytdl from "npm:@distube/ytdl-core"
 
-/* ================= Genius Token ================= */
 const geniusToken = Deno.env.get("GENIUS_ACCESS_TOKEN")
 
-/* ================= Basic Word Lists ================= */
 const BAD_WORDS = [
-  "cover","karaoke","tribute","sped up","speed up","slowed","nightcore"
+  "cover" , "romanized" , "translation"
 ]
 
 const FEATURE_WORDS = ["feat","ft","featuring","with"]
 
-/**
- * Removable phrases (multi-word) that are treated as noise if they appear:
- * (Ensure "music video" is present)
- */
 const PAREN_REMOVABLE_MULTI = [
+  "the first take",
   "english translation","live ver","live version","short ver","short version",
   "alt ver","alternate ver","alternate version","tv size","first take",
   "music video","official video","official mv"
 ]
 
-/**
- * Single tokens removable if they appear standalone (add "music" here).
- */
 const PAREN_REMOVABLE_SINGLE = [
   "instrumental","inst","offvocal","off-vocal","acoustic","piano","remix","mix","edit","demo",
   "live","ver","version","romanized","romaji","translation","english","tv","short","karaoke",
   "mv","official","video","visualizer","teaser","trailer","music"
 ]
 
-/* ================= Regex / Utility ================= */
 const TOKEN_SPLIT = /[ \t\-–—_:|\/.,!?()\[\]]+/
 const JP_REGEX = /[\p{sc=Hiragana}\p{sc=Katakana}\p{sc=Han}々ー〇ヶ]/u
 const ASCII_ROMAJI_PAREN = /^[A-Za-z0-9 .'_+\-]+$/
@@ -43,20 +34,11 @@ function stripPunctCanonical(s:string){
     .replace(/[！？。、（）【】「」『』·・…‥～]/g,"")
 }
 
-/* =========================================================
-   Trailing separator noise removal (NEW)
-   - Removes a trailing segment after a separator (- | – — ｜) if the segment
-     consists solely of removable phrases/tokens.
-   ========================================================= */
 function isAllRemovableTokens(seg: string): boolean {
   let low = nfkcLower(seg).trim()
   if (!low) return true
-
-  // Remove bracketed parts first (they will be separately handled later)
   low = low.replace(/(\([^)]*\)|\[[^\]]*])/g, " ").replace(/\s+/g, " ").trim()
   if (!low) return true
-
-  // Recursive multi-phrase stripping
   for (const phrase of PAREN_REMOVABLE_MULTI) {
     if (low === phrase) return true
     if (low.startsWith(phrase + " ")) {
@@ -64,8 +46,6 @@ function isAllRemovableTokens(seg: string): boolean {
       if (isAllRemovableTokens(rest)) return true
     }
   }
-
-  // Token-level check
   const toks = low.split(TOKEN_SPLIT).filter(Boolean)
   if (!toks.length) return true
   return toks.every(t =>
@@ -75,7 +55,6 @@ function isAllRemovableTokens(seg: string): boolean {
 }
 
 function stripTrailingSeparatorNoise(raw: string): string {
-  // Check only once (can be looped if cascading needed)
   const sepRegex = /(.+?)[\s]*[-–—|｜][\s]*([^]+)$/
   const m = raw.match(sepRegex)
   if (!m) return raw
@@ -86,7 +65,6 @@ function stripTrailingSeparatorNoise(raw: string): string {
   return raw
 }
 
-/* ================= Parenthesis Classification ================= */
 interface ParenInfo { raw:string; inner:string; role:ParenRole }
 type ParenRole = "romanization" | "translation" | "descriptor" | "feature" | "edition" | "other"
 
@@ -101,49 +79,61 @@ interface ParsedTitle {
 function classifyParen(inner: string, contextHasJapanese: boolean): ParenRole {
   const low = nfkcLower(inner).trim()
   if (!low) return "other"
-
   if (/^(feat|ft|featuring|with)\b/.test(low)) return "feature"
-
   if (PAREN_REMOVABLE_MULTI.some(m => low.includes(m))) {
     if (/(translation|english)/.test(low)) return "translation"
     if (/live/.test(low)) return "descriptor"
     return "edition"
   }
-
   if (/(translation|english)/.test(low)) return "translation"
   if (/(romanized|romaji)/.test(low)) return "romanization"
-
   if (contextHasJapanese && ASCII_ROMAJI_PAREN.test(inner) && /^[A-Za-z]/.test(inner)) {
     return "romanization"
   }
-
   if (/(instrumental|inst|live|ver|version|remix|mix|short|demo|edit|acoustic|piano|karaoke|off vocal|off-vocal|offvocal)/.test(low)) return "descriptor"
   if (/(official|mv|music|video|visualizer|teaser|trailer)/.test(low)) return "edition"
-
   return "other"
 }
 
-/* ========== parseTitle (Modified to use stripTrailingSeparatorNoise) ========== */
+function trimTrailingNoise(tokens: string[]): string[] {
+  while (tokens.length) {
+    let removed = false
+    const multiSorted = [...PAREN_REMOVABLE_MULTI].sort((a,b)=> b.length - a.length)
+    for (const phrase of multiSorted) {
+      const pToks = phrase.split(/\s+/)
+      if (tokens.length >= pToks.length) {
+        const tail = tokens.slice(-pToks.length).join(" ")
+        if (tail === phrase) {
+          tokens.splice(-pToks.length, pToks.length)
+            removed = true
+          break
+        }
+      }
+    }
+    if (removed) continue
+    const last = tokens[tokens.length - 1]
+    if (PAREN_REMOVABLE_SINGLE.includes(last)) {
+      tokens.pop()
+      continue
+    }
+    break
+  }
+  return tokens
+}
+
 function parseTitle(raw: string): ParsedTitle {
   let normalized = raw
     .replace(/[「『【〈《]/g,"(")
     .replace(/[」』】〉》]/g,")")
-
-  // NEW: remove trailing noise segment after separators
   normalized = stripTrailingSeparatorNoise(normalized)
-
   const hasJp = JP_REGEX.test(normalized)
   const parens: ParenInfo[] = []
   let work = normalized
-
-  // Extract parentheses
   work = work.replace(/(\([^)]*\)|\[[^\]]*])/g, (m)=>{
     const inner = m.slice(1,-1)
     parens.push({ raw:m, inner, role: classifyParen(inner, hasJp) })
     return " "
   })
-
-  // Split for feature tail
   const tokens = nfkcLower(work).split(TOKEN_SPLIT).filter(Boolean)
   let featureTail: string[] = []
   const idx = tokens.findIndex(t => FEATURE_WORDS.includes(t))
@@ -154,20 +144,7 @@ function parseTitle(raw: string): ParsedTitle {
   } else {
     baseTokens = tokens
   }
-
-  // Drop trailing removable tokens
-  while (baseTokens.length) {
-    const last = baseTokens[baseTokens.length-1]
-    if (
-      PAREN_REMOVABLE_SINGLE.includes(last) ||
-      PAREN_REMOVABLE_MULTI.some(m => m.endsWith(" "+last) || m === last)
-    ) {
-      baseTokens.pop()
-      continue
-    }
-    break
-  }
-
+  baseTokens = trimTrailingNoise(baseTokens)
   return {
     raw,
     base: baseTokens.join(" ").trim(),
@@ -177,7 +154,6 @@ function parseTitle(raw: string): ParsedTitle {
   }
 }
 
-/* ================= Variants ================= */
 interface TitleVariants {
   parsed: ParsedTitle
   variants: Set<string>
@@ -195,7 +171,6 @@ function buildTitleVariants(raw: string): TitleVariants {
   const variants = new Set<string>()
   const baseCanon = stripPunctCanonical(parsed.base)
   if (baseCanon) variants.add(baseCanon)
-
   const romajiList: string[] = []
   for (const p of parsed.parens) {
     if (p.role === "romanization") {
@@ -206,7 +181,6 @@ function buildTitleVariants(raw: string): TitleVariants {
       if (t) variants.add(t)
     }
   }
-
   if (parsed.parens.some(p => p.role==="romanization" || p.role==="translation")) {
     const collapsed = parsed.base + parsed.parens
       .filter(p => p.role==="romanization"||p.role==="translation")
@@ -214,14 +188,11 @@ function buildTitleVariants(raw: string): TitleVariants {
     const colCanon = stripPunctCanonical(collapsed)
     if (colCanon) variants.add(colCanon)
   }
-
   if (!parsed.hasJapanese) {
     const asciiNorm = asciiRomajiNormalize(parsed.base)
     if (asciiNorm) variants.add(asciiNorm)
   }
-
   const tokens = parsed.base.split(/\s+/).filter(Boolean).map(t => stripPunctCanonical(t)).filter(Boolean)
-
   return {
     parsed,
     variants,
@@ -231,17 +202,14 @@ function buildTitleVariants(raw: string): TitleVariants {
   }
 }
 
-/* ================= Matching ================= */
 function titleMatches(query: TitleVariants, candidate: TitleVariants, opts:{allowJapaneseVsRomajiAlone:boolean}): boolean {
   for (const v of query.variants) {
     if (candidate.variants.has(v)) return true
   }
-
   if (opts.allowJapaneseVsRomajiAlone) {
     if (query.jp && candidate.romaji.includes(asciiRomajiNormalize(query.jp))) return true
     if (candidate.jp && query.romaji.includes(asciiRomajiNormalize(candidate.jp))) return true
   }
-
   const qTokens = query.tokens
   const cTokens = candidate.tokens
   if (qTokens.length && cTokens.length) {
@@ -250,7 +218,6 @@ function titleMatches(query: TitleVariants, candidate: TitleVariants, opts:{allo
     const minLen = Math.min(qTokens.length, cTokens.length)
     if (minLen >= 2 && shared.length === minLen && minLen <= 3) return true
   }
-
   return false
 }
 
@@ -294,7 +261,6 @@ function containsBadWordOnlyInCandidate(candidateTitle: string, originalTitle: s
   return false
 }
 
-/* ================= Genius API ================= */
 async function geniusSearch(q: string) {
   if (!geniusToken) return []
   const url = `https://api.genius.com/search?q=${encodeURIComponent(q)}`
@@ -304,26 +270,43 @@ async function geniusSearch(q: string) {
   return json.response?.hits || []
 }
 
-/* ================= Query Strategy ================= */
+function stripLeadingArtistFromBase(base: string, artist: string): string {
+  if (!artist) return base
+  const artistTokens = nfkcLower(artist).split(TOKEN_SPLIT).filter(Boolean)
+  if (!artistTokens.length) return base
+  const baseTokens = nfkcLower(base).split(/\s+/).filter(Boolean)
+  let i = 0
+  while (i < artistTokens.length && i < baseTokens.length && baseTokens[i] === artistTokens[i]) {
+    i++
+  }
+  if (i > 0) {
+    return baseTokens.slice(i).join(' ') || base
+  }
+  return base
+}
+
 function buildQueriesFor(title: string, artist: string, tv: TitleVariants) {
   const qs: {label:string; q:string; requireArtist:boolean}[] = []
-  const base = tv.parsed.base
-  qs.push({ label:"base+artist", q: `${base} ${artist}`, requireArtist:true })
-
+  const rawBase = tv.parsed.base
+  const baseWithoutArtist = stripLeadingArtistFromBase(rawBase, artist) || rawBase
+  const jpTokens = baseWithoutArtist
+    .split(/\s+/)
+    .filter(t => JP_REGEX.test(t))
+  const jpOnly = jpTokens.join(' ').trim()
+  if (jpOnly) qs.push({ label:"jp_base+artist", q: `${jpOnly} ${artist}`, requireArtist:true })
+  qs.push({ label:"base+artist", q: `${baseWithoutArtist} ${artist}`, requireArtist:true })
+  if (jpOnly) qs.push({ label:"jp_only", q: jpOnly, requireArtist:false })
+  qs.push({ label:"base_only", q: baseWithoutArtist, requireArtist:false })
   for (const p of tv.parsed.parens) {
     if (p.role === "romanization" || p.role === "translation") {
       qs.push({ label:`paren_${p.role}`, q: `${p.inner} ${artist}`, requireArtist:true })
     }
   }
-
-  qs.push({ label:"base_only", q: base, requireArtist:false })
-
   for (const p of tv.parsed.parens) {
     if (p.role === "romanization") {
       qs.push({ label:"romaji_only", q: p.inner, requireArtist:false })
     }
   }
-
   const seen = new Set<string>()
   return qs.filter(x=>{
     const k = x.q.toLowerCase()
@@ -333,102 +316,37 @@ function buildQueriesFor(title: string, artist: string, tv: TitleVariants) {
   })
 }
 
-/* ================= Core Matching ================= */
-interface MatchResult { url: string | null; debug?: any }
-
-async function findGeniusUrl(title: string, artist: string, debug: boolean): Promise<MatchResult> {
-  if (!geniusToken) {
-    return { url: null, debug: debug ? { reason:"no_token" } : undefined }
-  }
-
+async function findGeniusUrl(title: string, artist: string): Promise<string | null> {
+  if (!geniusToken) return null
   const queryTV = buildTitleVariants(title)
   const queries = buildQueriesFor(title, artist, queryTV)
-
-  const debugSteps: any[] = []
-  let accepted: any = null
-
   for (const q of queries) {
     let hits: any[] = []
     try {
       hits = await geniusSearch(q.q)
-    } catch { /* ignore */ }
-
-    const examined: any[] = []
+    } catch {}
     for (const h of hits) {
       const r = h.result
       const cTitle = r.title || r.full_title || ""
       const cArtist = r.primary_artist?.name || ""
-
-      if (/\b(chapter|interview|review|article)\b/i.test(cTitle)) {
-        examined.push({ id:r.id, title:cTitle, artist:cArtist, decision:"reject:non_song_content" })
-        continue
-      }
-
-      if (containsBadWordOnlyInCandidate(cTitle, title)) {
-        examined.push({ id:r.id, title:cTitle, artist:cArtist, decision:"reject:bad_word" })
-        continue
-      }
-
+      if (/\b(chapter|interview|review|article)\b/i.test(cTitle)) continue
+      if (containsBadWordOnlyInCandidate(cTitle, title)) continue
       const candidateTV = buildTitleVariants(cTitle)
       const titlesOk = titleMatches(queryTV, candidateTV, { allowJapaneseVsRomajiAlone:true })
-      if (!titlesOk) {
-        examined.push({
-          id:r.id, title:cTitle, artist:cArtist,
-          decision:"reject:title_mismatch",
-          query_variants:[...queryTV.variants],
-          candidate_variants:[...candidateTV.variants]
-        })
-        continue
-      }
-
-      if (q.requireArtist) {
-        if (!artistMatches(artist, cArtist)) {
-          examined.push({ id:r.id, title:cTitle, artist:cArtist, decision:"reject:artist_mismatch" })
-          continue
-        }
-      }
-
-      accepted = {
-        id:r.id,
-        title:cTitle,
-        artist:cArtist,
-        url:r.url,
-        decision:"accept",
-        usedQuery:q.label,
-        title_variants_intersection: intersectionList(queryTV.variants, candidateTV.variants)
-      }
-      examined.push(accepted)
-      break
+      if (!titlesOk) continue
+      if (q.requireArtist && !artistMatches(artist, cArtist)) continue
+      return r.url
     }
-
-    debugSteps.push({ query:q, examined })
-    if (accepted) break
   }
-
-  return {
-    url: accepted ? accepted.url : null,
-    debug: debug ? {
-      accepted,
-      steps: debugSteps
-    } : undefined
-  }
+  return null
 }
 
-function intersectionList(a:Set<string>, b:Set<string>): string[] {
-  const out: string[] = []
-  for (const v of a) if (b.has(v)) out.push(v)
-  return out
-}
-
-/* ================= HTTP Route ================= */
 const app = new Hono()
 app.use("/", cors())
 
 app.get("/track", async (c) => {
   const videoId = c.req.query("v")
-  const debug = c.req.query("debug") === "1"
   if (!videoId) return c.json({ error: "Video ID is required" }, 400)
-
   const videoUrl = `https://www.youtube.com/watch?v=${videoId}`
   let info: any
   try {
@@ -436,27 +354,19 @@ app.get("/track", async (c) => {
   } catch (e) {
     return c.json({ error: "Failed to fetch video info", detail: String(e) }, 500)
   }
-
   const engagementPanel = info.response?.engagementPanels?.find((d: any) =>
     d.engagementPanelSectionListRenderer?.panelIdentifier === "engagement-panel-structured-description"
   )
-
   const songsSection = engagementPanel?.engagementPanelSectionListRenderer?.content
     ?.structuredDescriptionContentRenderer?.items?.find((d: any) => d.horizontalCardListRenderer !== undefined)
-
   if (!songsSection) return c.json({ song: false })
-
   const card = songsSection.horizontalCardListRenderer.cards?.[0]?.videoAttributeViewModel
   if (!card) return c.json({ song: false })
-
   const title = card.title
   const artist = card.subtitle
   const thumbnail = card.image?.sources?.[0]?.url
-
-  const { url: genius_url, debug: debugInfo } = await findGeniusUrl(title, artist, debug)
-  const resp: any = { song: true, title, artist, thumbnail, genius_url }
-  if (debug) resp.debug = debugInfo
-  return c.json(resp)
+  const genius_url = await findGeniusUrl(title, artist)
+  return c.json({ song: true, title, artist, thumbnail, genius_url })
 })
 
 Deno.serve(app.fetch)
