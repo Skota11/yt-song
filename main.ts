@@ -335,7 +335,7 @@ async function findGeniusUrl(title: string, artist: string): Promise<string | nu
       const titlesOk = titleMatches(queryTV, candidateTV, { allowJapaneseVsRomajiAlone:true })
       if (!titlesOk) continue
       if (q.requireArtist && !artistMatches(artist, cArtist)) continue
-      return r.url
+      return {url : r.url , id : r.id}
     }
   }
   return null
@@ -365,8 +365,8 @@ app.get("/track", async (c) => {
   const title = card.title
   const artist = card.subtitle
   const thumbnail = card.image?.sources?.[0]?.url
-  const genius_url = await findGeniusUrl(title, artist)
-  return c.json({ song: true, title, artist, thumbnail, genius_url })
+  const genius_result = await findGeniusUrl(title, artist)
+  return c.json({ song: true, title, artist, thumbnail, genius_url : genius_result.url , genius_id : genius_result.id })
 })
 
 Deno.serve(app.fetch)
