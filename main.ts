@@ -342,7 +342,7 @@ async function findGeniusUrl(title: string, artist: string): Promise<string | nu
 }
 
 const app = new Hono()
-app.use("/", cors())
+app.use("/track", cors())
 
 app.get("/track", async (c) => {
   const videoId = c.req.query("v")
